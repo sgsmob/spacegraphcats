@@ -11,29 +11,199 @@ import sys
 import collections
 import argparse
 from search.bgzf import bgzf
+import logging
+from typing import List, Dict, Set, Text
 
-def find_thin_path(first, second, link_d):
+
+def end_match(s, t, k, direction='sp'):
     """
-    Find the longest thin path whose first two vertices are (first, second.)
+    Compares the first or last k-1 bases of strings s,t for a match.
+    The direction argument is a two character string whose characters are 'p'
+    or 's', where the first character indicates whether to use the prefix or
+    suffix of s for comparison and the second character indicates likewise for
+    t.
+    Returns a boolean 2-tuple whose first entry indicates whether there is a
+    match and whose second entry indicates whether the reverse complement was
+    necessary for a match.  If there is no match, the second entry will always
+    be False.
     """
-    path = list()
-    curr = second
-    prev = first
-    while len(link_d[curr]) == 2:
-        path.append(curr)
-        for next_v in link_d[curr]:
-            if next_v != prev:
+    r = reverse_complement(t)
+    if direction not in ['pp', 'ss', 'ps', 'sp']:
+        raise ValueError("Valid directions are 'pp', 'ss', 'ps', 'sp'")
+    if direction[0] == 'p':
+        s_end = s[:k-1]
+    else:
+        s_end = s[1-k:]
+    if direction[1] == 'p':
+        t_end = t[:k-1]
+        r_end = r[:k-1]
+    else:
+        t_end = t[1-k:]
+        r_end = r[1-k:]
+    if s_end == t_end:
+        return (True, False)
+    elif s_end == r_end:
+        return (True, True)
+    else:
+        return (False, False)
+
+
+def is_directed_path(x, sequences, neighbors, k):
+    assert len(neighbors[x]) == 2,\
+            ValueError("is_directed_path requires a degree 2 vertex")
+    u, v = neighbors[x]
+    seq_u = sequences[u]
+    seq_v = sequences[v]
+    if end_match(seq_u, seq_v, k, 'pp') or\
+            end_match(seq_u, seq_v, k, 'ss'):
+        return False
+    else:
+        return True
+
+
+def reverse_complement(seq):
+    comp = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+    return "".join(comp[x] for x in reversed(seq))
+
+
+def contract_neighbor(x, u, neighbors, sequences, mean_abunds, sizes, k):
+    seq_x = sequences[x]
+    seq_u = sequences[u]
+    r = reverse_complement(seq_u)
+    logging.debug("neighbor {}".format(u))
+    logging.debug("seq_u: {}, {}".format(seq_u[:k-1], seq_u[1-k:]))
+    logging.debug("   rc: {}, {}".format(r[:k-1], r[1-k:]))
+    # check which direction the match occurs
+    match, rc = end_match(seq_x, seq_u, k, 'sp')
+    if match:
+        if rc:
+            sequences[x] += reverse_complement(seq_u)[k-1:]
+        else:
+            sequences[x] += seq_u[k-1:]
+    else:
+        # need to check whether reverse complement was used
+        if seq_x[:k-1] == seq_u[1-k:]:
+            sequences[x] = seq_u[:1-k] + seq_x
+        else:
+            r = reverse_complement(seq_u)
+            assert seq_x[:k-1] == r[1-k:]
+            sequences[x] = r[:1-k] + seq_x
+
+    total_abunds = mean_abunds[x] * sizes[x] + \
+        mean_abunds[u] * sizes[u]
+    sizes[x] += sizes[u]
+    mean_abunds[x] = total_abunds/sizes[x]
+    # remove v from the graph by making u's other neighbor the
+    # neighbor of x
+    # there is no neighbor if u has degree 1
+    if len(neighbors[u]) > 1:
+        for y in neighbors[u]:
+            if y != x:
                 break
         else:
-            err = "{} has two neighbors, {}, but they are both"
-                " {}".format(curr, link_d[curr], prev)
-            raise ValueError(err)
-        prev = curr
-        curr = next_v
-    return path
+            msg = "{} doesn't have {} as a neighbor".format(u, x)
+            raise ValueError(msg)
+        neighbors[y].remove(u)
+        neighbors[y].add(x)
+        neighbors[x].add(y)
+    else:
+        y = None  # for debug purposes
+    neighbors[x].remove(u)
+    neighbors[u] = set()
+    logging.debug(
+        "removed {}, replacing it with {}, {}".format(u, x, y))
+
+
+def contract_degree_two(non_pendants, neighbors, sequences, mean_abunds, sizes,
+                        k):
+    deg_2 = list()
+    for v, N in neighbors.items():
+        if v in non_pendants or len(N) == 0:
+            continue
+        u = list(N)[0]
+        neighbors[u].remove(v)
+        N.remove(u)
+        if len(neighbors[u]) == 2:
+            deg_2.append(u)
+    logging.debug("len(deg_2): {}".format(len(deg_2)))
+    for x in deg_2:
+        if len(neighbors[x]) != 2:
+            continue
+        u, v = list(neighbors[x])
+        seq_x = sequences[x]
+        seq_u = sequences[u]
+        seq_v = sequences[v]
+        # if uxv doesn't form a directed path, we can't do anything
+        if end_match(seq_u, seq_v, k, 'pp')[0] or\
+                end_match(seq_u, seq_v, k, 'ss')[0]:
+            continue
+        logging.debug("analyzing {}".format(x))
+        logging.debug("seq_x: {}, {}".format(seq_x[:k-1],
+                      seq_x[1-k:]))
+        # can only delete u or v if they have low degree and their
+        # neighbors have a directed path
+        u_deg = len(neighbors[u])
+        if u_deg == 1 or (u_deg == 2 and
+                          is_directed_path(u, sequences, neighbors, k)):
+            contract_neighbor(x, u, neighbors, sequences, mean_abunds,
+                              sizes, k)
+            non_pendants.remove(u)
+        v_deg = len(neighbors[v])
+        if v_deg == 1 or (v_deg == 2 and
+                          is_directed_path(v, sequences, neighbors, k)):
+            contract_neighbor(x, v, neighbors, sequences, mean_abunds,
+                              sizes, k)
+            non_pendants.remove(v)
+
+
+def read_bcalm(unitigs, debug, k):
+    # track offsets, mean abunds, and # k-mers for each contig
+    # track links between contig IDs
+    neighbors = collections.defaultdict(set)
+    mean_abunds = {}  # type: Dict[int, float]
+    sizes = {}  # type: Dict[int, int]
+    sequences = {}  # type: Dict[int, Text]
+
+    # walk the input unitigs file, tracking links between contigs and
+    # writing them to contigs_out.
+    print('reading unitigs from {}'.format(unitigs))
+    for n, record in enumerate(screed.open(unitigs)):
+        if n % 10000 == 0:
+            print('...', n, file=sys.stderr, end='\r')
+
+        name = record.name
+        name_split = name.split()
+
+        # note: contig_id may not be in order.
+        contig_id = int(name_split[0])
+
+        # track the various links
+        links = [x for x in name_split[1:] if x.startswith('L:')]
+        link_ids = [x.split(':')[2] for x in links]
+        link_ids = [int(x) for x in link_ids if int(x) != contig_id]
+
+        if debug:
+            print('link_ids for {} are {}'.format(contig_id, link_ids))
+
+        neighbors[contig_id].update(link_ids)
+
+        # get mean abund
+        abund = [x for x in name_split[1:] if x.startswith('km:')]
+        assert len(abund) == 1, abund
+        abund = abund[0].split(':')
+        assert len(abund) == 3
+        abund = float(abund[2])
+
+        # record the abundance sequence and size
+        mean_abunds[contig_id] = abund
+        sequences[contig_id] = record.sequence
+        sizes[contig_id] = len(record.sequence) - k + 1
+    return neighbors, sequences, mean_abunds, sizes
 
 
 def main(argv):
+    logging.basicConfig(filename='bcalm_to_gxt.log', filemode='w',
+                        level=logging.DEBUG)
     parser = argparse.ArgumentParser()
     parser.add_argument('bcalm_unitigs')
     parser.add_argument('gxt_out')
@@ -46,123 +216,36 @@ def main(argv):
                         default=1.1)
     args = parser.parse_args(argv)
 
-    ksize = args.ksize
+    k = args.ksize
 
     trim = not args.pendants
     trim_cutoff = args.abundance
-
-    # track links between contig IDs
-    link_d = collections.defaultdict(set)
+    unitigs = args.bcalm_unitigs
+    debug = args.debug
 
     gxtfp = open(args.gxt_out, 'wt')
     contigsfp = bgzf.open(args.contigs_out, 'wb')
     info_filename = args.contigs_out + '.info.csv'
     info_fp = open(info_filename, 'wt')
 
-    # track offsets, mean abunds, and # k-mers for each contig
-    offsets = {}
-    mean_abunds = {}
-    sizes = {}
-    sequences = {}
-
-    # walk the input unitigs file, tracking links between contigs and
-    # writing them to contigs_out.
-    max_contig_id = 0
-    print('reading unitigs from {}'.format(args.bcalm_unitigs))
-    for n, record in enumerate(screed.open(args.bcalm_unitigs)):
-        if n % 10000 == 0:
-            print('...', n, file=sys.stderr, end='\r')
-
-        name = record.name
-        name_split = name.split()
-
-        # note: contig_id may not be in order.
-        contig_id = int(name_split[0])
-
-        # track the various links
-        links = [ x for x in name_split[1:] if x.startswith('L:') ]
-        link_ids = [ x.split(':')[2] for x in links ]
-        link_ids = [ int(x) for x in link_ids ]
-
-        if args.debug:
-            print('link_ids for {} are {}'.format(contig_id, link_ids))
-
-        link_d[contig_id].update(link_ids)
-
-        # get mean abund
-        abund = [ x for x in name_split[1:] if x.startswith('km:') ]
-        assert len(abund) == 1, abund
-        abund = abund[0].split(':')
-        assert len(abund) == 3
-        abund = float(abund[2])
-
-
-        # record the abundance sequence and size
-        mean_abunds[contig_id] = abund
-        sequences[contig_id] = record.sequence
-        sizes[contig_id] = len(record.sequence) - ksize + 1
+    # load in the basic graph structure from the BCALM output file
+    neighbors, sequences, mean_abunds, sizes = read_bcalm(unitigs, debug, k)
 
     # if we are removing pendants, we need to relabel the contigs so they are
     # consecutive integers starting from 0.  If not, we create dummy data
     # structures to make the interface the same elsewhere in the data
     if trim:
-        non_pendants = set(v for v, N in link_d.items() if len(N) > 1 or \
-                        mean_abunds[v] > trim_cutoff)
-        for v, N in link_d.items():
-            if v in non_pendants or len(N) == 0:
-                continue
-            u = N[0]
-            link_d[u].remove(v)
-
-        # pendant removal may have made some vertices with degree 2.  If this creates a long path whose vertices all have degree 2 (a thin path), we should replace the thin path by a single vertex
-        thin_paths = set()  # vertices in a thin path
-        for x in non_pendants:
-            if x in thin_paths or len(link_d[x]) != 2:
-                continue
-            u, v = link_d[x]
-            # start our searches with vertices that have a neighbor of high degree and a neighbor of degree two.  u and v are thus far indistinguishable so we have to try both possibilities (v has high degree vs. u has high degree)
-            if len(link_d[u]) != 2:
-                path = find_thin_path(x, v, link_d)
-            elif len(link_d[v]) != 2:
-                path = find_thin_path(x, u, link_d)
-            else:
-                path = list()
-            thin_paths.update(path)
-            # update sequences
-            for w in path:
-                # decide whether the suffix of w is a prefix of x or vice versa
-                if sequences[w][:ksize-1] == sequences[x][1-ksize:]:
-                    # prefix of w is a suffix of x
-                    sequences[x] += sequences[w][ksize-1:]
-                elif sequences[x][:ksize-1] == sequences[w][1-ksize:]:
-                    # prefix of x is a suffix of w
-                    sequences[x] = sequences[w][:1-ksize] + sequences[x]
-                else:
-                    # there's an error
-                    err = "{} and {} don't have prefix-suffix overlap".format(
-                        sequences[w], sequences[x])
-                    raise ValueError(err)
-                # update sizes and mean_abunds
-                total_abunds = mean_abunds[x] * sizes[x] + \
-                    mean_abunds[w] * (sizes[w] - ksize + 1)
-                sizes[x] += sizes[w] - ksize + 1
-                mean_abunds[x] = total_abunds/sizes[x]
-
-            # update neighbors
-            if len(path) > 0:
-                for y in link_d[w]:
-                    if len(link_d[y]) != 2:
-                        break
-                link_d[y].remove(w)
-                link_d[x].remove(path[0])
-                link_d[x].append(y)
-                link_d[y].append(x)
-        non_pendants -= thin_paths
+        non_pendants = set(v for v, N in neighbors.items() if len(N) > 1 or
+                           mean_abunds[v] > trim_cutoff)
+        contract_degree_two(non_pendants, neighbors, sequences, mean_abunds,
+                            sizes, k)
     else:
-        non_pendants = list(link_d.keys())
+        non_pendants = list(neighbors.keys())
     aliases = {x: i for i, x in enumerate(non_pendants)}
     n = len(aliases)
 
+    # compute offsets
+    offsets = {}
     for x, i in aliases.items():
         offsets[x] = contigsfp.tell()
         contigsfp.write('>{}\n{}\n'.format(i, sequences[x]))
@@ -175,13 +258,9 @@ def main(argv):
 
     # write out all of the links, in 'from to' format.
     n_edges = 0
-    for node, edgelist in link_d.items():
-        # if node not in aliases:
-        #     continue
-        for next_node in edgelist:
-            # if next_node not in aliases:
-            #     continue
-            gxtfp.write('{} {}\n'.format(aliases[node], aliases[next_node]))
+    for v, N in neighbors.items():
+        for u in N:
+            gxtfp.write('{} {}\n'.format(aliases[v], aliases[u]))
             n_edges += 1
 
     print('{} vertices, {} edges'.format(n, n_edges))
