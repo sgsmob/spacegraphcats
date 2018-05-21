@@ -10,7 +10,7 @@ import screed
 import sys
 import collections
 import argparse
-from search.bgzf import bgzf
+from spacegraphcats.utils.bgzf import bgzf
 import logging
 from typing import List, Dict, Set, Text
 
@@ -198,6 +198,17 @@ def read_bcalm(unitigs, debug, k):
         mean_abunds[contig_id] = abund
         sequences[contig_id] = record.sequence
         sizes[contig_id] = len(record.sequence) - k + 1
+
+    fail = False
+    for source in neighbors:
+        for nbhd in neighbors[source]:
+            if source not in neighbors[nbhd]:
+                print('{} -> {}, but not {} -> {}'.format(source, nbhd,
+                                                          nbhd, source))
+                fail = True
+
+    assert not fail
+
     return neighbors, sequences, mean_abunds, sizes
 
 
